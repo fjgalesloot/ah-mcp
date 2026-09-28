@@ -3,6 +3,7 @@ module github.com/mrserzhan/ah-mcp
 go 1.23.0
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gwillem/appie-go v0.0.12
 	github.com/mark3labs/mcp-go v0.45.0
 )
