@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -252,6 +253,67 @@ func TestStartOAuthFlowScopesEverythingToTheSecret(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("callback without a code: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// The login page loads its assets from root-relative paths, so those must be
+// proxied — but only for a browser that came in through the secret URL.
+func TestFlowCookieGatesRootPaths(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	var reached []string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.URL.Path)
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/"+secret+"/", http.StripPrefix("/"+secret, withFlowCookie(secret, false, next)))
+	mux.Handle("/", requireFlowCookie(secret, next))
+
+	// Entering through the secret URL sets the cookie.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+secret+"/login", nil))
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != flowCookieName || cookies[0].Value != secret || !cookies[0].HttpOnly {
+		t.Fatalf("entry cookies = %+v, want one HttpOnly %s cookie holding the secret", cookies, flowCookieName)
+	}
+
+	cases := []struct {
+		name   string
+		cookie string
+		want   int
+	}{
+		{"no cookie", "", http.StatusNotFound},
+		{"wrong secret", flowCookieName + "=nope", http.StatusNotFound},
+		{"valid cookie", flowCookieName + "=" + secret, http.StatusOK},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/login/_next/static/chunks/app.js", nil)
+		if tc.cookie != "" {
+			req.Header.Set("Cookie", tc.cookie)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Fatalf("%s: status = %d, want %d", tc.name, rec.Code, tc.want)
+		}
+	}
+	if want := []string{"/login", "/login/_next/static/chunks/app.js"}; strings.Join(reached, ",") != strings.Join(want, ",") {
+		t.Fatalf("proxied paths = %v, want %v", reached, want)
+	}
+}
+
+func TestDropCookie(t *testing.T) {
+	h := http.Header{}
+	h.Add("Cookie", `a=1; `+flowCookieName+`=secret; b="x y"`)
+	h.Add("Cookie", "c=3")
+	dropCookie(h, flowCookieName)
+	if got, want := h.Get("Cookie"), `a=1; b="x y"; c=3`; got != want || len(h.Values("Cookie")) != 1 {
+		t.Fatalf("Cookie = %q, want %q", h.Values("Cookie"), want)
+	}
+
+	h = http.Header{"Cookie": {flowCookieName + "=secret"}}
+	dropCookie(h, flowCookieName)
+	if _, ok := h["Cookie"]; ok {
+		t.Fatalf("Cookie header should be removed when only the flow cookie was present, got %q", h.Values("Cookie"))
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,10 @@ const (
 	ahUserAgent     = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
 	oauthTimeout    = 5 * time.Minute
 	tokenRefreshBuf = 60 * time.Second
+
+	// flowCookieName carries the flow secret for requests the login page makes
+	// outside the secret prefix (see StartOAuthFlow).
+	flowCookieName = "ah_mcp_flow"
 
 	loginSuccessHTML = `<!DOCTYPE html>
 <html><head><title>Login Successful</title></head>
@@ -275,6 +280,8 @@ func StartOAuthFlow(callbackHost string, callbackPort int, tokensPath string, re
 			req.URL.Host = target.Host
 			req.Host = target.Host
 			req.Header.Del("Accept-Encoding")
+			// The flow cookie is ours; AH has no business seeing it.
+			dropCookie(req.Header, flowCookieName)
 			// Rewrite Origin and Referer so AH's API doesn't reject the request
 			// because it sees our proxy hostname instead of the AH login host.
 			if origin := req.Header.Get("Origin"); origin != "" {
@@ -292,8 +299,14 @@ func StartOAuthFlow(callbackHost string, callbackPort int, tokensPath string, re
 			http.Error(w, "proxy error", http.StatusBadGateway)
 		},
 	}
-	// Only the secret-scoped subtree is proxied; everything else 404s.
-	mux.Handle(prefix+"/", http.StripPrefix(prefix, proxy))
+	// AH's login page is a Next.js app that loads its scripts, styles and API
+	// calls from root-relative paths (/login/_next/...), which fall outside the
+	// secret prefix. Without them the page never hydrates and the login button
+	// stays disabled. So entering through the secret prefix hands the browser a
+	// cookie holding the secret, and root paths are proxied only when it is
+	// present. The callback stays reachable under the prefix alone.
+	mux.Handle(prefix+"/", http.StripPrefix(prefix, withFlowCookie(secret, !insecureOrigin, proxy)))
+	mux.Handle("/", requireFlowCookie(secret, proxy))
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -336,6 +349,60 @@ func StartOAuthFlow(callbackHost string, callbackPort int, tokensPath string, re
 		Done:     doneCh,
 		Cancel:   func() { cancelOnce.Do(func() { close(cancelCh) }) },
 	}, nil
+}
+
+// withFlowCookie gives the browser a cookie proving it entered through the
+// secret prefix, so requireFlowCookie lets its root-relative requests through.
+func withFlowCookie(secret string, secure bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c, err := r.Cookie(flowCookieName); err != nil || c.Value != secret {
+			http.SetCookie(w, &http.Cookie{
+				Name:     flowCookieName,
+				Value:    secret,
+				Path:     "/",
+				HttpOnly: true,
+				Secure:   secure,
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireFlowCookie serves next only for requests carrying the flow secret in
+// the flow cookie; everything else 404s, as if the path did not exist.
+func requireFlowCookie(secret string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(flowCookieName)
+		if err != nil || subtle.ConstantTimeCompare([]byte(c.Value), []byte(secret)) != 1 {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// dropCookie removes the named cookie from the Cookie header. It works on the
+// raw header rather than re-serialising parsed cookies, which would silently
+// drop upstream cookies whose values Go considers invalid.
+func dropCookie(h http.Header, name string) {
+	var kept []string
+	for _, line := range h.Values("Cookie") {
+		for _, part := range strings.Split(line, ";") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if n, _, _ := strings.Cut(part, "="); strings.TrimSpace(n) == name {
+				continue
+			}
+			kept = append(kept, part)
+		}
+	}
+	h.Del("Cookie")
+	if len(kept) > 0 {
+		h.Set("Cookie", strings.Join(kept, "; "))
+	}
 }
 
 // exchangeCodeAndSave exchanges an auth code for tokens and saves them.

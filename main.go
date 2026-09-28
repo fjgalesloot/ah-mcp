@@ -40,7 +40,9 @@ func appieVersion() string {
 }
 
 const (
-	defaultCallbackHost = "http://localhost:9876"
+	// 127.0.0.1, not localhost: hCaptcha refuses to run on a page served from
+	// "localhost", and AH's login page will not submit without it.
+	defaultCallbackHost = "http://127.0.0.1:9876"
 	defaultCallbackPort = 9876
 	defaultMCPPort      = 3000
 
@@ -77,6 +79,9 @@ func main() {
 
 	tools.LogInfo("startup", "config version=%s site=%s transport=%s remote=%t callback_host=%s callback_port=%d mcp_port=%d auth=%t log_file_set=%t",
 		version, ahSite(), *transport, *remote, callbackHost, callbackPort, mcpPort, mcpToken != "", os.Getenv("AH_LOG_FILE") != "")
+	if u, err := url.Parse(callbackHost); err == nil && strings.EqualFold(u.Hostname(), "localhost") {
+		tools.LogWarn("startup", "AH_CALLBACK_HOST uses localhost; hCaptcha refuses that hostname, so the AH login will fail with a captcha error. Use http://127.0.0.1:%d instead", callbackPort)
+	}
 
 	// Ensure token directory exists with secure permissions.
 	if err := os.MkdirAll(filepath.Dir(tokensPath), 0700); err != nil {

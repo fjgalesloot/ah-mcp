@@ -15,7 +15,7 @@ Each scenario shows the prompt to use and what a passing result looks like.
 ```
 Prompt: "Log in to Albert Heijn"
 Tool:   ah_login (call 1)
-Expect: A URL starting with http://localhost:9876/login?...
+Expect: A URL starting with http://127.0.0.1:9876/<secret>/login?...
 Action: Open the URL in your browser and complete the AH login.
 ```
 
