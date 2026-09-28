@@ -1,6 +1,6 @@
 module github.com/mrserzhan/ah-mcp
 
-go 1.23.0
+go 1.27.1
 
 require (
 	github.com/gwillem/appie-go v0.0.12
