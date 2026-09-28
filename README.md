@@ -222,6 +222,27 @@ Add to your MCP config (usually `~/.codeium/windsurf/mcp_config.json` or `~/.cur
 
 ## Remote server deployment
 
+### Docker / Compose
+
+The image (`ghcr.io/fjgalesloot/ah-mcp`, built by `.github/workflows/docker.yml` for amd64 and arm64) is distroless, runs as uid 65532 and serves Streamable HTTP on `0.0.0.0:8080/mcp`. It sets these defaults:
+
+| Variable | Value in the image |
+|---|---|
+| `AH_TOKENS_PATH` | `/data/ah-mcp/tokens.json` |
+| `AH_MCP_BIND` / `AH_MCP_PORT` | `0.0.0.0` / `8080` |
+| `AH_REMOTE` | `true` (no browser in a container; login proxy on `0.0.0.0:9876`) |
+
+```bash
+cp .env.example .env          # set AH_MCP_TOKEN=$(openssl rand -hex 32)
+mkdir -p data && sudo chown 65532:65532 data
+docker compose up -d
+```
+
+- The container won't start without `AH_MCP_TOKEN`.
+- Tokens persist in `./data/ah-mcp/tokens.json`.
+- `GET /healthz` returns `ok` without auth. The container healthcheck runs `/ah-mcp --healthcheck` against it, because the image has no shell or curl.
+- To log in from a browser that isn't on the Docker host, set `AH_CALLBACK_HOST` to the URL that reaches port 9876, preferably through a TLS reverse proxy.
+
 ### systemd setup
 
 1. Create a dedicated user:

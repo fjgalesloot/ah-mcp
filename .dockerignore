@@ -1,0 +1,17 @@
+# Only the Go source is needed to build; keep secrets and binaries out of the
+# build context.
+.git
+.github
+.env
+.env.*
+tokens.json
+tokens.json.tmp
+config.json
+.github_token
+data/
+dist/
+ah-mcp
+ah-mcp.exe
+ah-mcp.exe~
+Dockerfile
+docker-compose.yml
