@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -516,6 +517,8 @@ type orderItemEntry struct {
 	Name      string  `json:"name,omitempty"`
 	Quantity  int     `json:"quantity"`
 	Price     float64 `json:"price,omitempty"`
+	// PriceBeforeBonus is set when Price is a bonus price.
+	PriceBeforeBonus float64 `json:"price_before_bonus,omitempty"`
 }
 
 // orderView is the shared payload for ah_get_cart and ah_get_order_details.
@@ -534,6 +537,7 @@ func newOrderView(order *appie.Order) orderView {
 		if it.Product != nil {
 			e.Name = it.Product.Title
 			e.Price = it.Product.Price.Now
+			e.PriceBeforeBonus = it.Product.Price.Was
 		}
 		items = append(items, e)
 	}
@@ -546,6 +550,35 @@ func newOrderView(order *appie.Order) orderView {
 	}
 }
 
+// orderDetailsView is the ah_get_order_details payload. AH's details endpoint
+// carries no totals, so TotalPrice (which shadows orderView's) comes from the
+// order's fulfillment and is omitted when unknown rather than reported as 0.
+type orderDetailsView struct {
+	orderView
+	TotalPrice          *float64 `json:"total_price,omitempty"`
+	SubtotalBeforeBonus float64  `json:"subtotal_before_bonus"`
+}
+
+func newOrderDetailsView(order *appie.Order, total *float64) orderDetailsView {
+	return orderDetailsView{
+		orderView:           newOrderView(order),
+		TotalPrice:          total,
+		SubtotalBeforeBonus: math.Round(order.Subtotal()*100) / 100,
+	}
+}
+
+// fulfillmentTotal looks up an order's payable total among the fulfillments.
+// It returns nil when the order is not listed or AH reports no total for it.
+func fulfillmentTotal(fulfillments []appie.Fulfillment, orderID int) *float64 {
+	for _, f := range fulfillments {
+		if f.OrderID == orderID && f.TotalPrice > 0 {
+			total := f.TotalPrice
+			return &total
+		}
+	}
+	return nil
+}
+
 // --- ah_get_order_details ---
 
 func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
@@ -553,7 +586,8 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Order Details"),
 		mcp.WithDescription(
 			"Get the full item list for a specific Albert Heijn delivery order by its ID. "+
-				"Returns all products with names, quantities, and prices. "+
+				"Returns all products with names, quantities and unit prices (price is the bonus price when price_before_bonus is set), "+
+				"subtotal_before_bonus, and total_price (the amount payable, omitted when AH does not report one). "+
 				"Get order_id from ah_get_order_history.",
 		),
 		mcp.WithString("order_id",
@@ -575,7 +609,15 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 		}); err != nil {
 			return errResult(fmt.Sprintf("Failed to get order details for %d: %v", orderID, err)), nil
 		}
-		return jsonResult(newOrderView(order))
+
+		// The details endpoint has no totals; the fulfillment list does.
+		var total *float64
+		if fulfillments, fErr := c.GetFulfillments(ctx); fErr == nil {
+			total = fulfillmentTotal(fulfillments, orderID)
+		} else {
+			LogWarn("ah_get_order_details", "fetch fulfillments for total: %v", fErr)
+		}
+		return jsonResult(newOrderDetailsView(order, total))
 	}))
 }
 
