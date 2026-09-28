@@ -89,7 +89,7 @@ Requires Go 1.23+.
 |---|---|---|
 | `AH_SITE` | `nl` | Albert Heijn site to target. Supported values: `nl` and `be`. This switches the API/login hosts and the `X-Application` header used for requests. The Belgian `AHBEWEBSHOP` header mapping is based on reverse-engineering notes here: https://gist.github.com/jabbink/8bfa44bdfc535d696b340c46d228fdd1 |
 | `AH_LOG_FILE` | unset | Optional log file path. When set, tool/auth logs are written to stderr and appended to this file. |
-| `AH_CALLBACK_HOST` | `http://localhost:9876` | Base URL for the OAuth proxy. Users open this URL in their browser during login. Override to your server's public URL for remote deployments. |
+| `AH_CALLBACK_HOST` | `http://127.0.0.1:9876` | Base URL for the OAuth proxy. Users open this URL in their browser during login. Override to your server's public URL for remote deployments. Don't use `localhost`: hCaptcha refuses that hostname, so AH's login page can't load its captcha. |
 | `AH_CALLBACK_PORT` | `9876` | Port the temporary OAuth reverse-proxy server listens on. |
 | `AH_MCP_PORT` | `3000` | Port for the MCP HTTP server (`--transport sse` or `--transport streamable-http`). |
 | `AH_MCP_BASE_URL` | `http://localhost:3000` | Public base URL advertised to MCP clients. **Must be set for remote deployments** — otherwise clients receive a `localhost` URL they cannot reach. Example: `https://myserver.example.com` |
