@@ -78,6 +78,12 @@ type v2PatchItem struct {
 
 // removalPatch builds the quantity-0 payload that deletes an item.
 func removalPatch(it v2ListItem) v2PatchItem {
+	return itemPatch(it, 0)
+}
+
+// itemPatch builds the payload that sets an existing item's quantity. The v2
+// PATCH sets the quantity rather than adding to it, and unchecks the item.
+func itemPatch(it v2ListItem, quantity int) v2PatchItem {
 	name := it.name()
 	itemType := it.Type
 	if itemType == "" {
@@ -90,12 +96,58 @@ func removalPatch(it v2ListItem) v2PatchItem {
 	return v2PatchItem{
 		ProductID:     it.productID(),
 		Description:   name,
-		Quantity:      0,
+		Quantity:      quantity,
 		Type:          itemType,
 		OriginCode:    originCode,
 		SearchTerm:    name,
 		StrikeThrough: false,
 	}
+}
+
+// addPatches turns items to add into v2 PATCH payloads. Because the PATCH sets
+// quantities, a product already on the list gets its current quantity plus
+// the requested one — otherwise "add one more" would leave it unchanged. A
+// checked-off item starts again from the requested quantity. Duplicate
+// product IDs in items are summed. The payloads come out in the order the
+// products first appear in items.
+func addPatches(list []v2ListItem, items []lineItem) []v2PatchItem {
+	existing := make(map[int]v2ListItem, len(list))
+	for _, it := range list {
+		if pid := it.productID(); pid > 0 {
+			if _, seen := existing[pid]; !seen {
+				existing[pid] = it
+			}
+		}
+	}
+
+	var order []int
+	want := make(map[int]int, len(items))
+	for _, it := range items {
+		if _, seen := want[it.ProductID]; !seen {
+			order = append(order, it.ProductID)
+		}
+		want[it.ProductID] += it.Quantity
+	}
+
+	out := make([]v2PatchItem, 0, len(order))
+	for _, pid := range order {
+		qty := want[pid]
+		if cur, ok := existing[pid]; ok {
+			if !cur.StrikedThrough {
+				qty += cur.Quantity
+			}
+			out = append(out, itemPatch(cur, qty))
+			continue
+		}
+		// Same shape appie-go's AddToShoppingList sends for a new product.
+		out = append(out, v2PatchItem{
+			ProductID:  pid,
+			Quantity:   qty,
+			Type:       "SHOPPABLE",
+			OriginCode: "PRD",
+		})
+	}
+	return out
 }
 
 // fetchShoppingList reads the current Boodschappenlijst.
@@ -163,7 +215,8 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 		mcp.WithDescription(
 			"Add one or more products to your Albert Heijn shopping list. "+
 				"Pass an array of items, each with product_id (int) and quantity (int). "+
-				"Returns confirmation listing the names of successfully added products.",
+				"Quantities are added to what is already on the list: adding 1 of a product that is listed twice leaves 3. "+
+				"Returns confirmation listing each product's new quantity on the list.",
 		),
 		mcp.WithString("items",
 			mcp.Required(),
@@ -179,17 +232,21 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult("no valid items provided (each item needs product_id > 0 and quantity > 0)"), nil
 		}
 
-		listItems := toListItems(items)
-		if err := withRetry(ctx, "ah_add_to_shopping_list", func() error {
-			return c.AddToShoppingList(ctx, listItems)
-		}); err != nil {
+		// The PATCH sets quantities, so read the list first and send totals.
+		// Totals also make the retried PATCH idempotent.
+		list, err := fetchShoppingList(ctx, c, "ah_add_to_shopping_list")
+		if err != nil {
+			return errResult(fmt.Sprintf("Failed to read shopping list: %v", err)), nil
+		}
+		patches := addPatches(list.Items, items)
+		if err := patchShoppingList(ctx, c, "ah_add_to_shopping_list", patches); err != nil {
 			return errResult(fmt.Sprintf("Failed to add items: %v", err)), nil
 		}
 
 		// Fetch product names for the confirmation message.
-		pids := make([]int, 0, len(items))
-		for _, it := range items {
-			pids = append(pids, it.ProductID)
+		pids := make([]int, 0, len(patches))
+		for _, p := range patches {
+			pids = append(pids, p.ProductID)
 		}
 		nameMap := map[int]string{}
 		if products, pErr := c.GetProductsByIDs(ctx, pids); pErr == nil {
@@ -198,13 +255,13 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 			}
 		}
 
-		names := make([]string, 0, len(items))
-		for _, it := range items {
-			if n, ok := nameMap[it.ProductID]; ok {
-				names = append(names, fmt.Sprintf("%s (x%d)", n, it.Quantity))
-			} else {
-				names = append(names, fmt.Sprintf("Product %d (x%d)", it.ProductID, it.Quantity))
+		names := make([]string, 0, len(patches))
+		for _, p := range patches {
+			name, ok := nameMap[p.ProductID]
+			if !ok {
+				name = fmt.Sprintf("Product %d", p.ProductID)
 			}
+			names = append(names, fmt.Sprintf("%s (now x%d)", name, p.Quantity))
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Added to shopping list:\n- %s", strings.Join(names, "\n- "))), nil
 	}))
