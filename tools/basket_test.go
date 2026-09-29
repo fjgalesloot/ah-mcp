@@ -71,3 +71,45 @@ func TestRemovalPatchOmitsZeroProductID(t *testing.T) {
 		t.Fatalf("ProductID = %d, want 0 for a free-text item", got.ProductID)
 	}
 }
+
+// The v2 PATCH sets quantities, so adding to a listed product must send the
+// sum — sending the requested quantity alone left "add one more" a no-op.
+func TestAddPatchesAddsToExistingQuantity(t *testing.T) {
+	melk := productItem(111, "Melk halfvol", "", "SHOPPABLE", "PRD")
+	melk.Quantity = 1
+	list := []v2ListItem{melk}
+
+	got := addPatches(list, []lineItem{{ProductID: 111, Quantity: 1}, {ProductID: 222, Quantity: 3}})
+	if len(got) != 2 {
+		t.Fatalf("patches = %+v, want 2", got)
+	}
+	if got[0].ProductID != 111 || got[0].Quantity != 2 {
+		t.Fatalf("existing product patch = %+v, want product 111 at quantity 2 (1 listed + 1 added)", got[0])
+	}
+	if got[0].Description != "Melk halfvol" || got[0].Type != "SHOPPABLE" || got[0].OriginCode != "PRD" {
+		t.Fatalf("existing product patch = %+v, want the listed item's fields kept", got[0])
+	}
+	if got[1].ProductID != 222 || got[1].Quantity != 3 || got[1].Type != "SHOPPABLE" || got[1].OriginCode != "PRD" {
+		t.Fatalf("new product patch = %+v, want product 222 at quantity 3", got[1])
+	}
+}
+
+func TestAddPatchesSumsDuplicateProducts(t *testing.T) {
+	got := addPatches(nil, []lineItem{{ProductID: 5, Quantity: 1}, {ProductID: 6, Quantity: 1}, {ProductID: 5, Quantity: 2}})
+	if len(got) != 2 || got[0].ProductID != 5 || got[0].Quantity != 3 || got[1].ProductID != 6 {
+		t.Fatalf("patches = %+v, want product 5 once at quantity 3, then product 6", got)
+	}
+}
+
+// A checked-off item was already picked up; adding it again means it is
+// needed again, so it restarts from the requested quantity, unchecked.
+func TestAddPatchesRestartsCheckedItems(t *testing.T) {
+	done := productItem(7, "Brood", "", "SHOPPABLE", "PRD")
+	done.Quantity = 4
+	done.StrikedThrough = true
+
+	got := addPatches([]v2ListItem{done}, []lineItem{{ProductID: 7, Quantity: 1}})
+	if len(got) != 1 || got[0].Quantity != 1 || got[0].StrikeThrough {
+		t.Fatalf("patches = %+v, want quantity 1 and unchecked", got)
+	}
+}

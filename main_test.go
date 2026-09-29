@@ -27,7 +27,7 @@ func TestTokenEqual(t *testing.T) {
 }
 
 func TestSimpleAuthMiddleware(t *testing.T) {
-	h := simpleAuthMiddleware(testToken, okHandler())
+	h := simpleAuthMiddleware(&authenticator{token: testToken}, okHandler())
 
 	tests := []struct {
 		name   string
@@ -58,7 +58,7 @@ func TestSimpleAuthMiddleware(t *testing.T) {
 }
 
 func TestTokenAuthMiddlewareRejectsUnauthenticated(t *testing.T) {
-	h := tokenAuthMiddleware(testToken, okHandler())
+	h := tokenAuthMiddleware(&authenticator{token: testToken}, okHandler())
 
 	for _, path := range []string{"/sse", "/message?sessionId=made-up"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -85,7 +85,7 @@ func TestTokenAuthMiddlewareSessionLifecycle(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	h := tokenAuthMiddleware(testToken, inner)
+	h := tokenAuthMiddleware(&authenticator{token: testToken}, inner)
 
 	sseDone := make(chan struct{})
 	go func() {
@@ -214,11 +214,14 @@ func TestIsLoopbackBind(t *testing.T) {
 
 func TestCheckTransportAuth(t *testing.T) {
 	// A tokenless server on a public interface exposes the whole AH account.
-	if err := checkTransportAuth("0.0.0.0:3000", "", true); err == nil {
+	if err := checkTransportAuth("0.0.0.0:3000", "", false); err == nil {
 		t.Fatal("public bind without a token must be refused")
 	}
-	if err := checkTransportAuth("0.0.0.0:3000", testToken, true); err != nil {
+	if err := checkTransportAuth("0.0.0.0:3000", testToken, false); err != nil {
 		t.Fatalf("public bind with a token must be allowed: %v", err)
+	}
+	if err := checkTransportAuth("0.0.0.0:3000", "", true); err != nil {
+		t.Fatalf("public bind with OAuth must be allowed: %v", err)
 	}
 	if err := checkTransportAuth("127.0.0.1:3000", "", false); err != nil {
 		t.Fatalf("loopback bind without a token must warn, not fail: %v", err)
@@ -226,7 +229,7 @@ func TestCheckTransportAuth(t *testing.T) {
 }
 
 func TestHealthzBypassesAuthAndOrigin(t *testing.T) {
-	h := wrapHandler(okHandler(), testToken, "", 3000, false)
+	h := wrapHandler(okHandler(), &authenticator{token: testToken}, "", 3000, false)
 
 	req := httptest.NewRequest(http.MethodGet, healthPath, nil)
 	req.Header.Set("Origin", "https://evil.example")
@@ -266,7 +269,7 @@ func TestHealthcheckURL(t *testing.T) {
 }
 
 func TestProbeHealth(t *testing.T) {
-	srv := httptest.NewServer(wrapHandler(okHandler(), testToken, "", 3000, false))
+	srv := httptest.NewServer(wrapHandler(okHandler(), &authenticator{token: testToken}, "", 3000, false))
 	defer srv.Close()
 
 	if err := probeHealth(srv.URL + healthPath); err != nil {

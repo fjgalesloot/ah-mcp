@@ -33,7 +33,7 @@ COPY --from=build --chown=65532:65532 /out/data /data
 # AH_REMOTE: there is no browser to open inside a container, and the login
 #   proxy on 9876 must accept connections from outside the container.
 # AH_MCP_BIND/AH_MCP_PORT: listen on 0.0.0.0:8080; startup refuses this
-#   without AH_MCP_TOKEN.
+#   without AH_MCP_TOKEN or OAuth (AH_MCP_OAUTH_ISSUER).
 ENV AH_TOKENS_PATH=/data/ah-mcp/tokens.json \
     AH_MCP_BIND=0.0.0.0 \
     AH_MCP_PORT=8080 \

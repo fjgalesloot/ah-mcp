@@ -95,8 +95,10 @@ Requires Go 1.23+.
 | `AH_MCP_BASE_URL` | `http://localhost:3000` | Public base URL advertised to MCP clients. **Must be set for remote deployments** — otherwise clients receive a `localhost` URL they cannot reach. Example: `https://myserver.example.com` |
 | `AH_TOKENS_PATH` | `~/.config/ah-mcp/tokens.json` | Override the XDG token storage path. Directory is created automatically (mode `0700`). File is written with mode `0600`. |
 | `AH_REMOTE` | `false` | Set to `true` to enable remote mode (same as `--remote` flag). Disables automatic browser opening on login. |
-| `AH_MCP_TOKEN` | *(unset)* | Secret token required to access the HTTP server. Supply it as `Authorization: Bearer <token>` or `?token=<token>`. **Required** whenever the server binds a non-loopback address — startup fails without it. |
-| `AH_MCP_BIND` | loopback, or `0.0.0.0` with `--remote` | Interface to listen on (host only, no port). Set to `0.0.0.0` for containers that need a public bind without remote mode. Requires `AH_MCP_TOKEN`. |
+| `AH_MCP_TOKEN` | *(unset)* | Secret token required to access the HTTP server. Supply it as `Authorization: Bearer <token>` or `?token=<token>`. A non-loopback bind requires this or OAuth — startup fails with neither. Still accepted when OAuth is enabled. |
+| `AH_MCP_OAUTH_ISSUER` | *(unset)* | Enables OAuth: the issuer URL of the authorization server, exactly as it appears in the tokens' `iss` claim. For Authentik: `https://authentik.example.com/application/o/<slug>/` (trailing slash included). Must be `https`. See [OAuth with Authentik](#oauth-with-authentik). |
+| `AH_MCP_OAUTH_AUDIENCE` | *(unset)* | Required with `AH_MCP_OAUTH_ISSUER`: the `aud` value access tokens must carry. For Authentik this is the provider's client ID. |
+| `AH_MCP_BIND` | loopback, or `0.0.0.0` with `--remote` | Interface to listen on (host only, no port). Set to `0.0.0.0` for containers that need a public bind without remote mode. Requires `AH_MCP_TOKEN` or OAuth. |
 | `AH_MCP_ALLOWED_ORIGINS` | base URL + localhost + `https://claude.ai` | Comma-separated browser origins allowed to call the server. Requests with no `Origin` header (all non-browser MCP clients) always pass. Set to `*` to disable the check. |
 
 Copy `.env.example` to `.env` and uncomment lines you want to change.
@@ -106,7 +108,8 @@ Copy `.env.example` to `.env` and uncomment lines you want to change.
 This server acts on a logged-in Albert Heijn account: anything that can reach it can read your orders, receipts, address and date of birth, and change your cart. The defaults are set accordingly.
 
 - **Binds loopback by default.** `sse` and `streamable-http` listen on `127.0.0.1` unless you pass `--remote` (or set `AH_REMOTE=true` / `AH_MCP_BIND`).
-- **A network bind requires a token.** Starting with a non-loopback address and no `AH_MCP_TOKEN` is refused outright. A loopback server without a token logs a warning — any local process can then use your session.
+- **A network bind requires auth.** Starting with a non-loopback address and neither `AH_MCP_TOKEN` nor OAuth is refused outright. A loopback server without either logs a warning — any local process can then use your session.
+- **OAuth tokens are fully validated.** With `AH_MCP_OAUTH_ISSUER` set, bearer tokens must be JWTs signed with a key from the issuer's JWKS (asymmetric algorithms only — `none` and HMAC are refused), with a matching `iss` and `aud`, and an `exp` that has not passed (30 s clock leeway). JWTs are only accepted in the `Authorization` header, never in `?token=`.
 - **Origin checking.** Browser requests from an origin outside `AH_MCP_ALLOWED_ORIGINS` are rejected, which is what stops a malicious web page reaching a loopback server via DNS rebinding. Non-browser clients send no `Origin` and are unaffected.
 - **The login proxy is scoped to a one-time secret.** `ah_login` starts a short-lived reverse proxy under a random `/<secret>/` path that only appears in the login URL returned over MCP. Without it the proxy would relay to AH's login host for anyone who could reach the port, and its callback would accept an authorization code from a stranger — AH's flow carries no `state` parameter, so that would let someone bind *their* account to your server. Opening that URL sets an HttpOnly cookie holding the secret, which the login page's root-relative assets (`/login/_next/...`) need to get through; requests without it get a 404, and the callback only answers under the secret path.
 - **Tokens on disk.** Written atomically, file mode `0600`, directory `0700`.
@@ -164,6 +167,30 @@ Streamable HTTP uses regular HTTP requests instead of a persistent SSE connectio
    ```
 2. Open Claude → Settings → Connections → Add custom MCP server.
 3. Paste the URL: `https://your-server/mcp?token=your-secret-token`
+
+### OAuth with Authentik
+
+Instead of pasting a static token into the URL, the server can act as an OAuth resource server ([MCP authorization spec 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)), with [Authentik](https://goauthentik.io) as the authorization server. Clients that speak MCP OAuth (Claude.ai, Claude Desktop) then sign you in through Authentik.
+
+1. In Authentik, create an **OAuth2/OpenID Provider** and an **Application** for it. Add the client's redirect URI (for Claude: `https://claude.ai/api/mcp/auth_callback`). Note the client ID and the issuer URL shown on the provider page.
+2. Start the server:
+   ```bash
+   AH_MCP_BASE_URL=https://your-server \
+   AH_MCP_OAUTH_ISSUER=https://authentik.example.com/application/o/ah-mcp/ \
+   AH_MCP_OAUTH_AUDIENCE=<client id> \
+   AH_MCP_TOKEN=$(openssl rand -hex 32) \
+   ./ah-mcp --transport streamable-http --remote
+   ```
+   `AH_MCP_TOKEN` is optional here. Set it if you also want a static token, e.g. for Claude Code on the LAN.
+3. Add `https://your-server/mcp` as a connector, without `?token=`. If the client asks for an OAuth client ID, use the one from step 1.
+
+What the server does:
+
+- It serves `/.well-known/oauth-protected-resource` (RFC 9728), naming the issuer as the authorization server. This endpoint needs no credentials.
+- A request without a valid token gets `401` with `WWW-Authenticate: Bearer resource_metadata="<AH_MCP_BASE_URL>/.well-known/oauth-protected-resource"`, which is how the client discovers where to sign in.
+- It checks JWT signatures against the JWKS from Authentik's OpenID discovery document. Keys are cached for an hour, and an unknown `kid` triggers a refetch (at most once a minute), so key rotation needs no restart.
+
+`AH_MCP_BASE_URL` must be the public URL: it is the `resource` in the metadata and the URL in the `401` challenge.
 
 ### Claude.ai (web) — SSE (legacy)
 
@@ -239,7 +266,7 @@ mkdir -p data && sudo chown 65532:65532 data && sudo chmod 700 data
 docker compose up -d
 ```
 
-- The container won't start without `AH_MCP_TOKEN`.
+- The container won't start without `AH_MCP_TOKEN` or [OAuth](#oauth-with-authentik).
 - Tokens persist unencrypted in `./data/ah-mcp/tokens.json`. Anyone who can read that file, or `.env`, can use your AH account. That includes root and every member of the `docker` group, so keep that group small. Keep both files out of backups that leave the host, or encrypt those backups. Disk encryption (LUKS) covers a stolen or discarded disk.
 - `GET /healthz` returns `ok` without auth. The container healthcheck runs `/ah-mcp --healthcheck` against it, because the image has no shell or curl.
 - To log in from a browser that isn't on the Docker host, set `AH_CALLBACK_HOST` to the URL that reaches port 9876, preferably through a TLS reverse proxy.
@@ -364,8 +391,11 @@ Call `ah_logout` then `ah_login`. Or delete `tokens.json` manually:
 **Last-chance items require a store**
 `ah_get_last_chance_items` needs a store ID or postal code — bargain items are store-specific. Provide `store_id` or `postal_code` as a parameter.
 
-**"refusing to listen ... without AH_MCP_TOKEN"**
-You asked for a network bind (`--remote`, `AH_REMOTE=true` or `AH_MCP_BIND`) without a token. Set `AH_MCP_TOKEN`, or drop those to bind loopback only.
+**"refusing to listen ... without AH_MCP_TOKEN or AH_MCP_OAUTH_ISSUER"**
+You asked for a network bind (`--remote`, `AH_REMOTE=true` or `AH_MCP_BIND`) without auth. Set `AH_MCP_TOKEN` and/or configure OAuth, or drop those to bind loopback only.
+
+**"rejected bearer token" in the log**
+The reason follows. `invalid audience` means `AH_MCP_OAUTH_AUDIENCE` does not match the token's `aud` (for Authentik, the client ID). `reports issuer ... but AH_MCP_OAUTH_ISSUER is ...` means the configured issuer differs from Authentik's, which is usually a missing trailing slash.
 
 **403 "Forbidden origin"**
 A browser called the server from an origin that is not allowed. Add it to `AH_MCP_ALLOWED_ORIGINS` (comma separated), or set that to `*` to disable the check.
