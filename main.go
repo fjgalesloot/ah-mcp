@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -76,9 +77,14 @@ func main() {
 	mcpPort := envIntOr("AH_MCP_PORT", defaultMCPPort)
 	tokensPath := TokensPath()
 	mcpToken := os.Getenv("AH_MCP_TOKEN")
+	oauthCfg, err := oauthConfigFromEnv()
+	if err != nil {
+		tools.LogError("startup", "%v", err)
+		os.Exit(1)
+	}
 
-	tools.LogInfo("startup", "config version=%s site=%s transport=%s remote=%t callback_host=%s callback_port=%d mcp_port=%d auth=%t log_file_set=%t",
-		version, ahSite(), *transport, *remote, callbackHost, callbackPort, mcpPort, mcpToken != "", os.Getenv("AH_LOG_FILE") != "")
+	tools.LogInfo("startup", "config version=%s site=%s transport=%s remote=%t callback_host=%s callback_port=%d mcp_port=%d auth=%t oauth=%t log_file_set=%t",
+		version, ahSite(), *transport, *remote, callbackHost, callbackPort, mcpPort, mcpToken != "", oauthCfg != nil, os.Getenv("AH_LOG_FILE") != "")
 	if u, err := url.Parse(callbackHost); err == nil && strings.EqualFold(u.Hostname(), "localhost") {
 		tools.LogWarn("startup", "AH_CALLBACK_HOST uses localhost; hCaptcha refuses that hostname, so the AH login will fail with a captcha error. Use http://127.0.0.1:%d instead", callbackPort)
 	}
@@ -137,6 +143,11 @@ func main() {
 
 	ctx := context.Background()
 	appieVer := appieVersion()
+	baseURL := envOr("AH_MCP_BASE_URL", fmt.Sprintf("http://localhost:%d", mcpPort))
+	auth := newAuthenticator(mcpToken, oauthCfg, baseURL)
+	if oauthCfg != nil && os.Getenv("AH_MCP_BASE_URL") == "" && *transport != "stdio" {
+		tools.LogWarn("startup", "OAuth is enabled but AH_MCP_BASE_URL is unset; clients will be told this server lives at %s", baseURL)
+	}
 
 	switch *transport {
 	case "stdio":
@@ -147,38 +158,36 @@ func main() {
 			os.Exit(1)
 		}
 	case "sse", "":
-		baseURL := envOr("AH_MCP_BASE_URL", fmt.Sprintf("http://localhost:%d", mcpPort))
 		addr, err := bindAddr(mcpPort, *remote)
 		if err != nil {
 			tools.LogError("startup", "%v", err)
 			os.Exit(1)
 		}
-		if err := checkTransportAuth(addr, mcpToken, *remote); err != nil {
+		if err := checkTransportAuth(addr, mcpToken, oauthCfg != nil); err != nil {
 			tools.LogError("startup", "%v", err)
 			os.Exit(1)
 		}
-		tools.LogInfo("startup", "starting SSE transport addr=%s version=%s appie_go=%s base_url=%s auth=%t",
-			addr, version, appieVer, baseURL, mcpToken != "")
+		tools.LogInfo("startup", "starting SSE transport addr=%s version=%s appie_go=%s base_url=%s auth=%t oauth=%t",
+			addr, version, appieVer, baseURL, mcpToken != "", oauthCfg != nil)
 		sseSrv := server.NewSSEServer(s, server.WithBaseURL(baseURL), server.WithKeepAlive(true), server.WithKeepAliveInterval(5*time.Second))
-		serve(addr, wrapHandler(sseSrv, mcpToken, baseURL, mcpPort, true))
+		serve(addr, wrapHandler(sseSrv, auth, baseURL, mcpPort, true))
 	case "streamable-http":
-		baseURL := envOr("AH_MCP_BASE_URL", fmt.Sprintf("http://localhost:%d", mcpPort))
 		addr, err := bindAddr(mcpPort, *remote)
 		if err != nil {
 			tools.LogError("startup", "%v", err)
 			os.Exit(1)
 		}
-		if err := checkTransportAuth(addr, mcpToken, *remote); err != nil {
+		if err := checkTransportAuth(addr, mcpToken, oauthCfg != nil); err != nil {
 			tools.LogError("startup", "%v", err)
 			os.Exit(1)
 		}
-		tools.LogInfo("startup", "starting Streamable HTTP transport addr=%s version=%s appie_go=%s base_url=%s auth=%t",
-			addr, version, appieVer, baseURL, mcpToken != "")
+		tools.LogInfo("startup", "starting Streamable HTTP transport addr=%s version=%s appie_go=%s base_url=%s auth=%t oauth=%t",
+			addr, version, appieVer, baseURL, mcpToken != "", oauthCfg != nil)
 		httpSrv := server.NewStreamableHTTPServer(s,
 			server.WithEndpointPath("/mcp"),
 			server.WithHeartbeatInterval(5*time.Second),
 		)
-		serve(addr, wrapHandler(httpSrv, mcpToken, baseURL, mcpPort, false))
+		serve(addr, wrapHandler(httpSrv, auth, baseURL, mcpPort, false))
 	default:
 		tools.LogError("startup", "unknown transport %q — use 'sse', 'streamable-http', or 'stdio'", *transport)
 		os.Exit(1)
@@ -214,16 +223,16 @@ func isLoopbackBind(addr string) bool {
 }
 
 // checkTransportAuth refuses to expose an authenticated AH account to the
-// network without a token, and warns when a loopback server has none.
-func checkTransportAuth(addr, token string, remote bool) error {
-	if token != "" {
+// network without a token or OAuth, and warns when a loopback server has neither.
+func checkTransportAuth(addr, token string, oauth bool) error {
+	if token != "" || oauth {
 		return nil
 	}
 	if !isLoopbackBind(addr) {
-		return fmt.Errorf("refusing to listen on %s without AH_MCP_TOKEN: this server acts on your Albert Heijn account "+
-			"and would be usable by anyone who can reach that address. Set AH_MCP_TOKEN, or drop --remote/AH_MCP_BIND to bind loopback only", addr)
+		return fmt.Errorf("refusing to listen on %s without AH_MCP_TOKEN or AH_MCP_OAUTH_ISSUER: this server acts on your Albert Heijn account "+
+			"and would be usable by anyone who can reach that address. Configure auth, or drop --remote/AH_MCP_BIND to bind loopback only", addr)
 	}
-	tools.LogWarn("startup", "AH_MCP_TOKEN is not set — any process on this machine can use your Albert Heijn session")
+	tools.LogWarn("startup", "neither AH_MCP_TOKEN nor OAuth is configured — any process on this machine can use your Albert Heijn session")
 	return nil
 }
 
@@ -254,16 +263,29 @@ func serve(addr string, handler http.Handler) {
 	tools.LogInfo("shutdown", "stopped")
 }
 
-// wrapHandler applies Origin validation and, when configured, token auth.
-func wrapHandler(next http.Handler, token, baseURL string, port int, sse bool) http.Handler {
-	if token != "" {
+// wrapHandler applies Origin validation and, when configured, auth. With
+// OAuth enabled it also serves the protected resource metadata, which must be
+// reachable without credentials: it is how a client learns where to get them.
+func wrapHandler(next http.Handler, auth *authenticator, baseURL string, port int, sse bool) http.Handler {
+	if auth != nil {
 		if sse {
-			next = tokenAuthMiddleware(token, next)
+			next = tokenAuthMiddleware(auth, next)
 		} else {
-			next = simpleAuthMiddleware(token, next)
+			next = simpleAuthMiddleware(auth, next)
 		}
 	}
-	return originMiddleware(allowedOrigins(baseURL, port), next)
+	next = originMiddleware(allowedOrigins(baseURL, port), next)
+	if auth == nil || auth.jwt == nil {
+		return next
+	}
+	metadata := protectedResourceHandler(baseURL, auth.jwt.issuer)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProtectedResourcePath(r.URL.Path) {
+			metadata.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // envOr returns the value of the named environment variable or the default.
@@ -343,27 +365,81 @@ func originMiddleware(allowed []string, next http.Handler) http.Handler {
 	})
 }
 
-// tokenAuthMiddleware rejects requests that do not carry the expected token.
-// The token is accepted as:
-//   - Authorization: Bearer <token>  header, OR
-//   - ?token=<token>                 query parameter
+var (
+	errNoCredentials = errors.New("no credentials")
+	errInvalidToken  = errors.New("invalid token")
+)
+
+// authenticator accepts the static AH_MCP_TOKEN and, when OAuth is
+// configured, JWT access tokens from the authorization server.
+type authenticator struct {
+	token               string       // static AH_MCP_TOKEN; "" when unset
+	jwt                 *jwtVerifier // nil when OAuth is not configured
+	resourceMetadataURL string
+}
+
+// newAuthenticator returns nil when neither a static token nor OAuth is set.
+func newAuthenticator(token string, oauth *oauthConfig, baseURL string) *authenticator {
+	if token == "" && oauth == nil {
+		return nil
+	}
+	a := &authenticator{token: token}
+	if oauth != nil {
+		a.jwt = newJWTVerifier(oauth.Issuer, oauth.Audience, nil)
+		a.resourceMetadataURL = strings.TrimSuffix(baseURL, "/") + protectedResourcePath
+	}
+	return a
+}
+
+// check accepts:
+//   - Authorization: Bearer <AH_MCP_TOKEN or JWT>
+//   - ?token=<AH_MCP_TOKEN>  (static token only: the MCP spec forbids access
+//     tokens in the query string)
+func (a *authenticator) check(r *http.Request) error {
+	if h := r.Header.Get("Authorization"); h != "" {
+		if a.token != "" && tokenEqual(h, "Bearer "+a.token) {
+			return nil
+		}
+		scheme, raw, ok := strings.Cut(h, " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || a.jwt == nil {
+			return errInvalidToken
+		}
+		if _, err := a.jwt.Verify(r.Context(), strings.TrimSpace(raw)); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidToken, err)
+		}
+		return nil
+	}
+	if q := r.URL.Query().Get("token"); q != "" {
+		if a.token != "" && tokenEqual(q, a.token) {
+			return nil
+		}
+		return errInvalidToken
+	}
+	return errNoCredentials
+}
+
+// reject writes a 401. With OAuth enabled it carries the RFC 9728 challenge
+// that points the client at the protected resource metadata.
+func (a *authenticator) reject(w http.ResponseWriter, err error) {
+	if a.resourceMetadataURL != "" {
+		challenge := fmt.Sprintf(`Bearer resource_metadata="%s"`, a.resourceMetadataURL)
+		if errors.Is(err, errInvalidToken) {
+			challenge = fmt.Sprintf(`Bearer error="invalid_token", resource_metadata="%s"`, a.resourceMetadataURL)
+			tools.LogWarn("http", "rejected bearer token: %v", err)
+		}
+		w.Header().Set("WWW-Authenticate", challenge)
+	}
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
+// tokenAuthMiddleware rejects requests that the authenticator does not accept.
 //
 // Once an SSE connection is authenticated, the sessionId it receives is
 // whitelisted so that subsequent /message posts (which don't carry the token)
 // are also allowed. The entry is dropped when the SSE stream ends, so a
 // session id cannot be replayed after the client disconnects.
-func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
+func tokenAuthMiddleware(auth *authenticator, next http.Handler) http.Handler {
 	var sessions sync.Map // sessionId string -> struct{}
-
-	isAuthed := func(r *http.Request) bool {
-		if h := r.Header.Get("Authorization"); h != "" {
-			return tokenEqual(h, "Bearer "+token)
-		}
-		if q := r.URL.Query().Get("token"); q != "" {
-			return tokenEqual(q, token)
-		}
-		return false
-	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// /message: allow if sessionId was established by an authenticated SSE connection.
@@ -376,8 +452,8 @@ func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 			}
 		}
 
-		if !isAuthed(r) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		if err := auth.check(r); err != nil {
+			auth.reject(w, err)
 			return
 		}
 
@@ -436,18 +512,14 @@ func (sc *sessionCapture) Flush() {
 	}
 }
 
-// simpleAuthMiddleware checks every request for a bearer token or ?token= query param.
+// simpleAuthMiddleware authenticates every request.
 // Used for streamable-http where each request is independent (no session tracking needed).
-func simpleAuthMiddleware(token string, next http.Handler) http.Handler {
+func simpleAuthMiddleware(auth *authenticator, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h := r.Header.Get("Authorization"); h != "" && tokenEqual(h, "Bearer "+token) {
-			next.ServeHTTP(w, r)
+		if err := auth.check(r); err != nil {
+			auth.reject(w, err)
 			return
 		}
-		if q := r.URL.Query().Get("token"); q != "" && tokenEqual(q, token) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		next.ServeHTTP(w, r)
 	})
 }
