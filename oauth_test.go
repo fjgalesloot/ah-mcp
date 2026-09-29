@@ -415,8 +415,15 @@ func TestWrapHandlerServesProtectedResourceMetadata(t *testing.T) {
 		}
 	}
 
-	// The MCP endpoint itself still requires credentials and points at the metadata.
+	// The health probe stays open with OAuth enabled too.
 	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s status = %d, want 200 without credentials", healthPath, rec.Code)
+	}
+
+	// The MCP endpoint itself still requires credentials and points at the metadata.
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("/mcp status = %d, want 401", rec.Code)

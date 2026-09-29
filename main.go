@@ -7,6 +7,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,16 +52,30 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 120 * time.Second
 	shutdownTimeout   = 10 * time.Second
+
+	// healthPath answers without auth so container runtimes and reverse
+	// proxies can probe liveness. It reveals nothing but "ok".
+	healthPath         = "/healthz"
+	healthcheckTimeout = 3 * time.Second
 )
 
 func main() {
 	transport := flag.String("transport", "sse", "Transport mode: 'sse', 'streamable-http', or 'stdio'")
 	remote := flag.Bool("remote", false, "Remote mode: bind all interfaces and disable auto browser-open on login (overridden by AH_REMOTE=true)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	healthcheck := flag.Bool("healthcheck", false, "Probe the running HTTP server's "+healthPath+" and exit 0 if healthy (for container healthchecks)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("ah-mcp %s (appie-go %s)\n", version, appieVersion())
+		os.Exit(0)
+	}
+
+	if *healthcheck {
+		if err := probeHealth(healthcheckURL(envIntOr("AH_MCP_PORT", defaultMCPPort))); err != nil {
+			fmt.Fprintf(os.Stderr, "unhealthy: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -275,17 +291,56 @@ func wrapHandler(next http.Handler, auth *authenticator, baseURL string, port in
 		}
 	}
 	next = originMiddleware(allowedOrigins(baseURL, port), next)
-	if auth == nil || auth.jwt == nil {
-		return next
+	if auth != nil && auth.jwt != nil {
+		metadata := protectedResourceHandler(baseURL, auth.jwt.issuer)
+		inner := next
+		next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isProtectedResourcePath(r.URL.Path) {
+				metadata.ServeHTTP(w, r)
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
 	}
-	metadata := protectedResourceHandler(baseURL, auth.jwt.issuer)
+	return healthMiddleware(next)
+}
+
+// healthMiddleware serves healthPath ahead of Origin and token checks, so a
+// probe needs no credentials.
+func healthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isProtectedResourcePath(r.URL.Path) {
-			metadata.ServeHTTP(w, r)
+		if r.URL.Path == healthPath {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = io.WriteString(w, "ok\n")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// healthcheckURL points at the local server's health endpoint. A wildcard
+// bind is probed over loopback, since that is where the probe runs.
+func healthcheckURL(port int) string {
+	host := strings.Trim(os.Getenv("AH_MCP_BIND"), "[]")
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port)) + healthPath
+}
+
+// probeHealth reports whether url answers 200.
+func probeHealth(url string) error {
+	client := &http.Client{Timeout: healthcheckTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned %s", url, resp.Status)
+	}
+	return nil
 }
 
 // envOr returns the value of the named environment variable or the default.

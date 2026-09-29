@@ -227,3 +227,55 @@ func TestCheckTransportAuth(t *testing.T) {
 		t.Fatalf("loopback bind without a token must warn, not fail: %v", err)
 	}
 }
+
+func TestHealthzBypassesAuthAndOrigin(t *testing.T) {
+	h := wrapHandler(okHandler(), &authenticator{token: testToken}, "", 3000, false)
+
+	req := httptest.NewRequest(http.MethodGet, healthPath, nil)
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Fatalf("healthz = %d %q, want 200 \"ok\n\"", rec.Code, rec.Body.String())
+	}
+
+	// Everything else still needs the token.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/mcp without token = %d, want 401", rec.Code)
+	}
+}
+
+func TestHealthcheckURL(t *testing.T) {
+	tests := []struct {
+		bind string
+		want string
+	}{
+		{"", "http://127.0.0.1:8080/healthz"},
+		{"0.0.0.0", "http://127.0.0.1:8080/healthz"},
+		{"[::]", "http://127.0.0.1:8080/healthz"},
+		{"10.0.0.5", "http://10.0.0.5:8080/healthz"},
+		{"[::1]", "http://[::1]:8080/healthz"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.bind, func(t *testing.T) {
+			t.Setenv("AH_MCP_BIND", tc.bind)
+			if got := healthcheckURL(8080); got != tc.want {
+				t.Fatalf("healthcheckURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProbeHealth(t *testing.T) {
+	srv := httptest.NewServer(wrapHandler(okHandler(), &authenticator{token: testToken}, "", 3000, false))
+	defer srv.Close()
+
+	if err := probeHealth(srv.URL + healthPath); err != nil {
+		t.Fatalf("probeHealth on healthy server: %v", err)
+	}
+	if err := probeHealth(srv.URL + "/mcp"); err == nil {
+		t.Fatal("probeHealth must fail on a non-200 response")
+	}
+}

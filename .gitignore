@@ -16,3 +16,6 @@ ah-mcp.exe~
 
 # Go build artifacts
 /vendor/
+
+# Container data (tokens.json lives here)
+/data/

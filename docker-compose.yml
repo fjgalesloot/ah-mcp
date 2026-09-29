@@ -1,0 +1,27 @@
+# Before the first start:
+#   cp .env.example .env && chmod 600 .env   # then set AH_MCP_TOKEN (openssl rand -hex 32)
+#   mkdir -p data && sudo chown 65532:65532 data && sudo chmod 700 data   # the container runs as nonroot
+services:
+  ah-mcp:
+    image: ghcr.io/fjgalesloot/ah-mcp:latest
+    build: .
+    container_name: ah-mcp
+    restart: unless-stopped
+    env_file: .env
+    command: ["--transport", "streamable-http"]
+    ports:
+      - "8080:8080" # MCP endpoint: http://<host>:8080/mcp
+      - "9876:9876" # login proxy, only listening while ah_login is in progress
+    volumes:
+      - ./data:/data # tokens end up in ./data/ah-mcp/tokens.json
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/ah-mcp", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
