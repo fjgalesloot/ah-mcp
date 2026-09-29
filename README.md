@@ -234,12 +234,13 @@ The image (`ghcr.io/fjgalesloot/ah-mcp`, built by `.github/workflows/docker.yml`
 
 ```bash
 cp .env.example .env          # set AH_MCP_TOKEN=$(openssl rand -hex 32)
-mkdir -p data && sudo chown 65532:65532 data
+chmod 600 .env
+mkdir -p data && sudo chown 65532:65532 data && sudo chmod 700 data
 docker compose up -d
 ```
 
 - The container won't start without `AH_MCP_TOKEN`.
-- Tokens persist in `./data/ah-mcp/tokens.json`.
+- Tokens persist unencrypted in `./data/ah-mcp/tokens.json`. Anyone who can read that file, or `.env`, can use your AH account. That includes root and every member of the `docker` group, so keep that group small. Keep both files out of backups that leave the host, or encrypt those backups. Disk encryption (LUKS) covers a stolen or discarded disk.
 - `GET /healthz` returns `ok` without auth. The container healthcheck runs `/ah-mcp --healthcheck` against it, because the image has no shell or curl.
 - To log in from a browser that isn't on the Docker host, set `AH_CALLBACK_HOST` to the URL that reaches port 9876, preferably through a TLS reverse proxy.
 
